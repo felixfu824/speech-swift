@@ -98,6 +98,24 @@ public enum HuggingFaceDownloader {
         let hub = makeHubApi(for: modelId, repoDir: directory)
         let repo = Hub.Repo(id: modelId)
 
+        // Cache-first: a complete local snapshot must never require the Hub.
+        // Offline mode validates the snapshot from disk (per-file metadata +
+        // LFS hash integrity) without any network I/O; the online path — with
+        // its per-file HEAD revalidation — is reached only when that
+        // validation fails (first download, partial cache, corrupt file).
+        // Without this, a Hub outage (e.g. HTTP 503 while the network itself
+        // is up, which automatic offline detection does not cover) bricks
+        // loading a model that is fully cached on disk.
+        let offlineHub = makeHubApi(for: modelId, repoDir: directory, useOfflineMode: true)
+        do {
+            try await offlineHub.snapshot(from: repo, matching: globs)
+            AudioLog.download.info("Using validated local cache for \(modelId, privacy: .public) (no Hub contact)")
+            return
+        } catch {
+            AudioLog.download.info(
+                "Local cache not usable for \(modelId, privacy: .public) (\(error.localizedDescription, privacy: .public)); contacting Hub")
+        }
+
         do {
             try await hub.snapshot(from: repo, matching: globs) { progress in
                 progressHandler?(progress.fractionCompleted)
@@ -178,7 +196,7 @@ public enum HuggingFaceDownloader {
 
     /// Create a `HubApi` whose `downloadBase` is derived from the repo directory that
     /// `getCacheDirectory` returned (strips the `models/<org>/<model>` suffix).
-    private static func makeHubApi(for modelId: String, repoDir: URL) -> HubApi {
+    private static func makeHubApi(for modelId: String, repoDir: URL, useOfflineMode: Bool? = nil) -> HubApi {
         // repoDir is  base/models/org/model
         // We need     base
         let repo = Hub.Repo(id: modelId)
@@ -193,6 +211,6 @@ public enum HuggingFaceDownloader {
             // Hub won't match this path, so we derive base from env/defaults.
             downloadBase = resolveBaseCacheDir(cacheDirName: repoDir.deletingLastPathComponent().lastPathComponent)
         }
-        return HubApi(downloadBase: downloadBase)
+        return HubApi(downloadBase: downloadBase, useOfflineMode: useOfflineMode)
     }
 }
