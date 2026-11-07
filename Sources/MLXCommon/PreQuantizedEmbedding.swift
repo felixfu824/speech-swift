@@ -20,11 +20,11 @@ public class PreQuantizedEmbedding: Module {
         self.bits = bits
 
         // Packed dimensions: 8 values per uint32 for 4-bit
-        let packedDim = dimensions / (32 / bits)
+        let packedDim = bits == 0 ? dimensions : dimensions * bits / 32
         let numGroups = dimensions / groupSize
 
         // Initialize with zeros - will be loaded from weights
-        self._weight.wrappedValue = MLXArray.zeros([embeddingCount, packedDim], dtype: .uint32)
+        self._weight.wrappedValue = MLXArray.zeros([embeddingCount, packedDim], dtype: bits == 0 ? .bfloat16 : .uint32)
         self._scales.wrappedValue = MLXArray.zeros([embeddingCount, numGroups], dtype: .bfloat16)
         self._biases.wrappedValue = MLXArray.zeros([embeddingCount, numGroups], dtype: .bfloat16)
 
@@ -33,6 +33,7 @@ public class PreQuantizedEmbedding: Module {
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if bits == 0 { return weight[x] }
         let s = x.shape
         let x = x.flattened()
         let out = dequantized(
@@ -43,7 +44,8 @@ public class PreQuantizedEmbedding: Module {
 
     /// For use as LM head (matmul with transposed weight)
     public func asLinear(_ x: MLXArray) -> MLXArray {
-        quantizedMatmul(
+        if bits == 0 { return matmul(x, weight.T) }
+        return quantizedMatmul(
             x, weight, scales: scales, biases: biases, transpose: true,
             groupSize: groupSize, bits: bits)
     }

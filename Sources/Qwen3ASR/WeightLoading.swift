@@ -18,111 +18,53 @@ public enum WeightLoader {
         into audioEncoder: Qwen3AudioEncoder,
         from directory: URL
     ) throws {
-        // Find all safetensors files
-        let fileManager = FileManager.default
-        let contents = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        let safetensorFiles = contents.filter { $0.pathExtension == "safetensors" }
-
-        guard !safetensorFiles.isEmpty else {
-            throw WeightLoadingError.noWeightsFound(directory)
-        }
-
-        print("Found \(safetensorFiles.count) safetensor files")
-
-        // Load all weight files
-        var allWeights: [String: MLXArray] = [:]
-        for file in safetensorFiles {
-            print("Loading: \(file.lastPathComponent)")
-            let weights = try loadSafetensors(url: file)
-            allWeights.merge(weights) { _, new in new }
-        }
-
-        print("Loaded \(allWeights.count) weight tensors from files")
-
-        // Filter to audio_tower weights and strip prefix
-        var audioTowerWeights: [String: MLXArray] = [:]
-        for (key, value) in allWeights {
-            if key.hasPrefix("audio_tower.") {
-                let strippedKey = String(key.dropFirst("audio_tower.".count))
-                audioTowerWeights[strippedKey] = value
-            }
-        }
-
-        print("Found \(audioTowerWeights.count) audio_tower weights")
-
-        // Apply weights to each component using update(parameters:)
-        applyConv2dWeights(to: audioEncoder.conv2d1, prefix: "conv2d1", from: audioTowerWeights)
-        applyConv2dWeights(to: audioEncoder.conv2d2, prefix: "conv2d2", from: audioTowerWeights)
-        applyConv2dWeights(to: audioEncoder.conv2d3, prefix: "conv2d3", from: audioTowerWeights)
-
-        // Output linear (no bias)
-        CommonWeightLoader.applyLinearWeights(to: audioEncoder.convOut, prefix: "conv_out", from: audioTowerWeights)
-
-        // Post layer norm
-        CommonWeightLoader.applyLayerNormWeights(to: audioEncoder.lnPost, prefix: "ln_post", from: audioTowerWeights)
-
-        // Projector layers
-        CommonWeightLoader.applyLinearWeights(to: audioEncoder.proj1, prefix: "proj1", from: audioTowerWeights)
-        CommonWeightLoader.applyLinearWeights(to: audioEncoder.proj2, prefix: "proj2", from: audioTowerWeights)
-
-        // Transformer layers (indexed as layers.0, layers.1, etc.)
-        for (index, layer) in audioEncoder.layers.enumerated() {
-            let prefix = "layers.\(index)"
-            applyEncoderLayerWeights(to: layer, prefix: prefix, from: audioTowerWeights)
-        }
-
-        print("Applied weights to audio encoder (\(audioEncoder.layers.count) layers)")
+        let weights = try normalizedWeights(from: directory)
+        try applyStrict(audioEncoder, weights: weights, prefix: "audio_tower.")
     }
 
-    /// Load and apply weights to quantized text decoder
     public static func loadTextDecoderWeights(
-        into textModel: QuantizedTextModel,
-        from directory: URL
+        into textModel: QuantizedTextModel, from directory: URL
     ) throws {
-        // Find all safetensors files
-        let fileManager = FileManager.default
-        let contents = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        let safetensorFiles = contents.filter { $0.pathExtension == "safetensors" }
+        try applyStrict(textModel, weights: normalizedWeights(from: directory), prefix: "model.")
+    }
 
-        guard !safetensorFiles.isEmpty else {
-            throw WeightLoadingError.noWeightsFound(directory)
-        }
-
-        // Load all weight files
-        var allWeights: [String: MLXArray] = [:]
-        for file in safetensorFiles {
-            let weights = try loadSafetensors(url: file)
-            allWeights.merge(weights) { _, new in new }
-        }
-
-        // Filter to model.* weights (text decoder)
-        var textWeights: [String: MLXArray] = [:]
-        for (key, value) in allWeights {
-            if key.hasPrefix("model.") {
-                let strippedKey = String(key.dropFirst("model.".count))
-                textWeights[strippedKey] = value
+    static func normalizedWeights(from directory: URL) throws -> [String: MLXArray] {
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "safetensors" }.sorted { $0.path < $1.path }
+        guard !files.isEmpty else { throw WeightLoadingError.noWeightsFound(directory) }
+        var weights: [String: MLXArray] = [:]
+        for file in files {
+            for (key, value) in try loadSafetensors(url: file) {
+                guard weights.updateValue(value, forKey: key) == nil else {
+                    throw WeightLoadingError.incompatibleWeights("Duplicate tensor across shards: \(key)")
+                }
             }
         }
-
-        print("Found \(textWeights.count) text decoder weights")
-
-        // Load embedding weights (quantized)
-        CommonWeightLoader.applyQuantizedEmbeddingWeights(
-            to: textModel.embedTokens,
-            prefix: "embed_tokens",
-            from: textWeights
-        )
-
-        // Load final layer norm
-        CommonWeightLoader.applyRMSNormWeights(to: textModel.norm, prefix: "norm", from: textWeights)
-
-        // Load each decoder layer
-        for (index, layer) in textModel.layers.enumerated() {
-            let prefix = "layers.\(index)"
-            applyQuantizedDecoderLayerWeights(to: layer, prefix: prefix, from: textWeights)
+        var result: [String: MLXArray] = [:]
+        for (original, value) in weights {
+            let key = original.hasPrefix("thinker.") ? String(original.dropFirst(8)) : original
+            guard key.hasPrefix("audio_tower.") || key.hasPrefix("model.") else {
+                throw WeightLoadingError.incompatibleWeights("Unexpected tensor: \(original)")
+            }
+            guard result.updateValue(value, forKey: key) == nil else {
+                throw WeightLoadingError.incompatibleWeights("Duplicate tensor: \(key)")
+            }
         }
+        return result
+    }
 
-        print("Applied weights to text decoder (\(textModel.layers.count) layers)")
+    static func applyStrict(_ module: Module, weights: [String: MLXArray], prefix: String) throws {
+        var selected = Dictionary(uniqueKeysWithValues: weights.compactMap { key, value in
+            key.hasPrefix(prefix) ? (String(key.dropFirst(prefix.count)), value) : nil
+        })
+        if let text = module as? QuantizedTextModel, text.embedTokens.bits == 0 {
+            for key in ["scales", "biases"] {
+                let path = "embed_tokens." + key
+                guard selected[path] == nil else { throw WeightLoadingError.incompatibleWeights("Unexpected float embedding tensor: \(path)") }
+                selected[path] = key == "scales" ? text.embedTokens.scales : text.embedTokens.biases
+            }
+        }
+        try module.update(parameters: ModuleParameters.unflattened(selected), verify: .all)
     }
 
     // MARK: - Forced Aligner Weight Loading
@@ -238,10 +180,10 @@ public enum WeightLoader {
         from weights: [String: MLXArray]
     ) {
         // Self attention
-        CommonWeightLoader.applyQuantizedLinearWeights(to: layer.selfAttn.qProj, prefix: "\(prefix).self_attn.q_proj", from: weights)
-        CommonWeightLoader.applyQuantizedLinearWeights(to: layer.selfAttn.kProj, prefix: "\(prefix).self_attn.k_proj", from: weights)
-        CommonWeightLoader.applyQuantizedLinearWeights(to: layer.selfAttn.vProj, prefix: "\(prefix).self_attn.v_proj", from: weights)
-        CommonWeightLoader.applyQuantizedLinearWeights(to: layer.selfAttn.oProj, prefix: "\(prefix).self_attn.o_proj", from: weights)
+        CommonWeightLoader.applyLinearWeights(to: layer.selfAttn.qProj, prefix: "\(prefix).self_attn.q_proj", from: weights)
+        CommonWeightLoader.applyLinearWeights(to: layer.selfAttn.kProj, prefix: "\(prefix).self_attn.k_proj", from: weights)
+        CommonWeightLoader.applyLinearWeights(to: layer.selfAttn.vProj, prefix: "\(prefix).self_attn.v_proj", from: weights)
+        CommonWeightLoader.applyLinearWeights(to: layer.selfAttn.oProj, prefix: "\(prefix).self_attn.o_proj", from: weights)
 
         // Q/K norms
         CommonWeightLoader.applyRMSNormWeights(to: layer.selfAttn.qNorm, prefix: "\(prefix).self_attn.q_norm", from: weights)
@@ -252,9 +194,9 @@ public enum WeightLoader {
         CommonWeightLoader.applyRMSNormWeights(to: layer.postAttentionLayerNorm, prefix: "\(prefix).post_attention_layernorm", from: weights)
 
         // MLP
-        CommonWeightLoader.applyQuantizedLinearWeights(to: layer.mlp.gateProj, prefix: "\(prefix).mlp.gate_proj", from: weights)
-        CommonWeightLoader.applyQuantizedLinearWeights(to: layer.mlp.upProj, prefix: "\(prefix).mlp.up_proj", from: weights)
-        CommonWeightLoader.applyQuantizedLinearWeights(to: layer.mlp.downProj, prefix: "\(prefix).mlp.down_proj", from: weights)
+        CommonWeightLoader.applyLinearWeights(to: layer.mlp.gateProj, prefix: "\(prefix).mlp.gate_proj", from: weights)
+        CommonWeightLoader.applyLinearWeights(to: layer.mlp.upProj, prefix: "\(prefix).mlp.up_proj", from: weights)
+        CommonWeightLoader.applyLinearWeights(to: layer.mlp.downProj, prefix: "\(prefix).mlp.down_proj", from: weights)
     }
 
     private static func applyFloatDecoderLayerWeights(

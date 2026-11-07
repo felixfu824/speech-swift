@@ -12,16 +12,20 @@ public class QuantizedTextAttention: Module {
     let headDim: Int
     let scale: Float
 
-    @ModuleInfo var qProj: QuantizedLinear
-    @ModuleInfo var kProj: QuantizedLinear
-    @ModuleInfo var vProj: QuantizedLinear
-    @ModuleInfo var oProj: QuantizedLinear
-    @ModuleInfo var qNorm: RMSNorm
-    @ModuleInfo var kNorm: RMSNorm
+    @ModuleInfo(key: "q_proj") var qProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "v_proj") var vProj: Linear
+    @ModuleInfo(key: "o_proj") var oProj: Linear
+    @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
+    @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
     let rope: MLXNN.RoPE
 
-    public init(config: TextDecoderConfig) {
+    public convenience init(config: TextDecoderConfig) {
+        self.init(config: config, path: "")
+    }
+
+    public init(config: TextDecoderConfig, path: String) {
         self.numHeads = config.numHeads
         self.numKVHeads = config.numKVHeads
         self.headDim = config.headDim
@@ -30,18 +34,18 @@ public class QuantizedTextAttention: Module {
         let hiddenSize = config.hiddenSize
 
         // Create quantized linear layers
-        self._qProj.wrappedValue = QuantizedLinear(
+        self._qProj.wrappedValue = config.makeLinear(
             hiddenSize, numHeads * headDim, bias: false,
-            groupSize: config.groupSize, bits: config.bits)
-        self._kProj.wrappedValue = QuantizedLinear(
+            path: path + ".q_proj")
+        self._kProj.wrappedValue = config.makeLinear(
             hiddenSize, numKVHeads * headDim, bias: false,
-            groupSize: config.groupSize, bits: config.bits)
-        self._vProj.wrappedValue = QuantizedLinear(
+            path: path + ".k_proj")
+        self._vProj.wrappedValue = config.makeLinear(
             hiddenSize, numKVHeads * headDim, bias: false,
-            groupSize: config.groupSize, bits: config.bits)
-        self._oProj.wrappedValue = QuantizedLinear(
+            path: path + ".v_proj")
+        self._oProj.wrappedValue = config.makeLinear(
             numHeads * headDim, hiddenSize, bias: false,
-            groupSize: config.groupSize, bits: config.bits)
+            path: path + ".o_proj")
 
         // Q/K normalization (Qwen3 specific)
         self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
@@ -110,23 +114,27 @@ public class QuantizedTextAttention: Module {
 /// MLP for Qwen3 text decoder (SwiGLU activation, quantized)
 /// Wraps the shared QuantizedMLP for backward compatibility
 public class QuantizedTextMLP: Module {
-    @ModuleInfo var gateProj: QuantizedLinear
-    @ModuleInfo var upProj: QuantizedLinear
-    @ModuleInfo var downProj: QuantizedLinear
+    @ModuleInfo(key: "gate_proj") var gateProj: Linear
+    @ModuleInfo(key: "up_proj") var upProj: Linear
+    @ModuleInfo(key: "down_proj") var downProj: Linear
 
-    public init(config: TextDecoderConfig) {
+    public convenience init(config: TextDecoderConfig) {
+        self.init(config: config, path: "")
+    }
+
+    public init(config: TextDecoderConfig, path: String) {
         let hiddenSize = config.hiddenSize
         let intermediateSize = config.intermediateSize
 
-        self._gateProj.wrappedValue = QuantizedLinear(
+        self._gateProj.wrappedValue = config.makeLinear(
             hiddenSize, intermediateSize, bias: false,
-            groupSize: config.groupSize, bits: config.bits)
-        self._upProj.wrappedValue = QuantizedLinear(
+            path: path + ".gate_proj")
+        self._upProj.wrappedValue = config.makeLinear(
             hiddenSize, intermediateSize, bias: false,
-            groupSize: config.groupSize, bits: config.bits)
-        self._downProj.wrappedValue = QuantizedLinear(
+            path: path + ".up_proj")
+        self._downProj.wrappedValue = config.makeLinear(
             intermediateSize, hiddenSize, bias: false,
-            groupSize: config.groupSize, bits: config.bits)
+            path: path + ".down_proj")
 
         super.init()
     }
@@ -141,14 +149,18 @@ public class QuantizedTextMLP: Module {
 
 /// Decoder layer for Qwen3 text model (quantized)
 public class QuantizedTextDecoderLayer: Module {
-    @ModuleInfo var selfAttn: QuantizedTextAttention
+    @ModuleInfo(key: "self_attn") var selfAttn: QuantizedTextAttention
     @ModuleInfo var mlp: QuantizedTextMLP
-    @ModuleInfo var inputLayerNorm: RMSNorm
-    @ModuleInfo var postAttentionLayerNorm: RMSNorm
+    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
-    public init(config: TextDecoderConfig) {
-        self._selfAttn.wrappedValue = QuantizedTextAttention(config: config)
-        self._mlp.wrappedValue = QuantizedTextMLP(config: config)
+    public convenience init(config: TextDecoderConfig) {
+        self.init(config: config, path: "")
+    }
+
+    public init(config: TextDecoderConfig, path: String) {
+        self._selfAttn.wrappedValue = QuantizedTextAttention(config: config, path: path + ".self_attn")
+        self._mlp.wrappedValue = QuantizedTextMLP(config: config, path: path + ".mlp")
         self._inputLayerNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
         self._postAttentionLayerNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
@@ -180,7 +192,7 @@ public class QuantizedTextDecoderLayer: Module {
 public class QuantizedTextModel: Module {
     public let config: TextDecoderConfig
 
-    @ModuleInfo public var embedTokens: PreQuantizedEmbedding
+    @ModuleInfo(key: "embed_tokens") public var embedTokens: PreQuantizedEmbedding
     @ModuleInfo var layers: [QuantizedTextDecoderLayer]
     @ModuleInfo var norm: RMSNorm
 
@@ -190,10 +202,10 @@ public class QuantizedTextModel: Module {
         self._embedTokens.wrappedValue = PreQuantizedEmbedding(
             embeddingCount: config.vocabSize,
             dimensions: config.hiddenSize,
-            groupSize: config.groupSize,
-            bits: config.bits)
-        self._layers.wrappedValue = (0..<config.numLayers).map { _ in
-            QuantizedTextDecoderLayer(config: config)
+            groupSize: config.embeddingSettings.groupSize,
+            bits: config.embeddingSettings.bits)
+        self._layers.wrappedValue = (0..<config.numLayers).map { i in
+            QuantizedTextDecoderLayer(config: config, path: "model.layers.\(i)")
         }
         self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
 

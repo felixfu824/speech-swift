@@ -56,3 +56,11 @@ The model automatically detects the spoken language from the audio content. No l
 ## Model Architecture Reference
 
 See [docs/models/asr-model.md](../models/asr-model.md) for detailed architecture documentation including layer dimensions, weight formats, and quantization details.
+
+### Local and mixed-precision checkpoints
+
+`Qwen3ASRModel.fromPretrained(modelId:)` accepts a local model directory as well as a HuggingFace ID. Local directories must contain `config.json`, safetensors weights and tokenizer files. The `quantization` block (or `quantization_config` alias) takes precedence over precision inferred from the ID. Affine recipes support global `bits`/`group_size` defaults, checkpoint module path overrides, and `false` to retain floating point. Encoder linears are quantized when explicitly configured or when stored scales identify a quantized encoder; legacy decoder-only recipes retain their float encoder. The tied embedding also has independent precision.
+
+ASR loading verifies every module parameter name and shape, including quantization scales and biases, and rejects unknown tensor namespaces. Both `audio_tower.*`/`model.*` keys and their `thinker.`-prefixed equivalents are accepted. Malformed recipes and incompatible checkpoints throw instead of silently producing invalid transcriptions. Existing public decoder model types and default constructors remain available.
+
+The opt-in `E2EMixedPrecisionParityTests` runner accepts `ASR_PARITY_MODEL`, `ASR_PARITY_INPUT` (JSONL with `wav`, or newline-separated WAV paths), and `ASR_PARITY_OUTPUT`; it writes greedy transcriptions with automatic language detection and load/RSS measurements. `ASR_PARITY_LANGUAGE` optionally forces a language. It skips when the required variables are absent. Checkpoints with per-module recipes use the native mlx-audio automatic-language prompt; decoder-only global recipes retain historical aufklarer prompting.

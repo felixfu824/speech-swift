@@ -151,7 +151,12 @@ public class Qwen3ASRModel {
             let langTokens = tokenizer.encode(langPrefix)
             inputIds.append(contentsOf: langTokens.map { Int32($0) })
         }
-        inputIds.append(Int32(asrTextId))
+        // Mixed-precision mlx-audio checkpoints use the native auto-language prompt:
+        // the model generates the language prefix and ASR marker itself.
+        // Keep the historical prompt for legacy decoder-only checkpoints.
+        if language != nil || textConfig.usesLegacyASRPrompt {
+            inputIds.append(Int32(asrTextId))
+        }
 
         // Get text embeddings for all tokens
         let inputIdsTensor = MLXArray(inputIds).expandedDimensions(axis: 0)
@@ -309,29 +314,42 @@ public extension Qwen3ASRModel {
         progressHandler?(0.0, "Downloading model...")
 
         // Auto-detect model size and quantization bits from model ID
-        let modelSize = ASRModelSize.detect(from: modelId)
+        var modelSize = ASRModelSize.detect(from: modelId)
         let detectedBits = ASRModelSize.detectBits(from: modelId)
 
         // Get cache directory
-        let cacheDir = try HuggingFaceDownloader.getCacheDirectory(for: modelId)
-
-        // Download weights and tokenizer files (skips files that already exist on disk)
-        // Download is the slowest part — give it 0-80% of progress
-        try await HuggingFaceDownloader.downloadWeights(
-            modelId: modelId,
-            to: cacheDir,
-            additionalFiles: ["vocab.json", "merges.txt", "tokenizer_config.json"],
-            progressHandler: { progress in
-                progressHandler?(progress * 0.8, "Downloading weights...")
-            }
-        )
+        let localURL = URL(fileURLWithPath: (modelId as NSString).expandingTildeInPath)
+        var isDirectory: ObjCBool = false
+        let isLocal = FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDirectory) && isDirectory.boolValue
+        let cacheDir: URL
+        if isLocal {
+            cacheDir = localURL
+        } else {
+            cacheDir = try HuggingFaceDownloader.getCacheDirectory(for: modelId)
+            try await HuggingFaceDownloader.downloadWeights(
+                modelId: modelId, to: cacheDir,
+                additionalFiles: ["vocab.json", "merges.txt", "tokenizer_config.json"],
+                progressHandler: { progressHandler?($0 * 0.8, "Downloading weights...") })
+        }
+        let configURL = cacheDir.appendingPathComponent("config.json")
+        let configData = try Data(contentsOf: configURL)
+        let json = try JSONSerialization.jsonObject(with: configData) as? [String: Any] ?? [:]
+        let thinker = json["thinker_config"] as? [String: Any] ?? json
+        let text = thinker["text_config"] as? [String: Any] ?? [:]
+        if let hidden = text["hidden_size"] as? Int { modelSize = hidden == 2048 ? .large : .small }
+        var textConfig = modelSize.textConfig(bits: detectedBits)
+        if let block = json["quantization"] ?? json["quantization_config"] {
+            textConfig.quantization = try JSONDecoder().decode(ASRQuantization.self, from: JSONSerialization.data(withJSONObject: block))
+            textConfig.bits = textConfig.quantization!.defaults.bits
+            textConfig.groupSize = textConfig.quantization!.defaults.groupSize
+        }
 
         progressHandler?(0.80, "Loading tokenizer...")
 
         // Create model with appropriate config for detected size and bits
         let model = Qwen3ASRModel(
             audioConfig: modelSize.audioConfig,
-            textConfig: modelSize.textConfig(bits: detectedBits)
+            textConfig: textConfig
         )
 
         // Load tokenizer from vocab.json
@@ -344,6 +362,17 @@ public extension Qwen3ASRModel {
 
         progressHandler?(0.85, "Loading audio encoder weights...")
 
+        if let quantization = textConfig.quantization {
+            // Legacy aufklarer recipes describe the decoder only; their encoder remains float.
+            let weights = try WeightLoader.normalizedWeights(from: cacheDir)
+            quantize(model: model.audioEncoder) { path, module in
+                let fullPath = "audio_tower." + path
+                guard module is Linear,
+                      quantization.overrides[fullPath] != nil || weights[fullPath + ".scales"] != nil,
+                      let settings = quantization.settings(for: fullPath) else { return nil }
+                return (settings.groupSize, settings.bits, .affine)
+            }
+        }
         // Load audio encoder weights
         try WeightLoader.loadWeights(into: model.audioEncoder, from: cacheDir)
 

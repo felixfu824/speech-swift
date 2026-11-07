@@ -61,6 +61,7 @@ public struct TextDecoderConfig: Codable, Sendable {
     // Quantization config
     public var groupSize: Int = 64
     public var bits: Int = 4
+    public var quantization: ASRQuantization? = nil
 
     public init() {}
 

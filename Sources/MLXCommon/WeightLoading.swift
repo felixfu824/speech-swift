@@ -124,6 +124,11 @@ public enum CommonWeightLoader {
             params["bias"] = .value(bias)
         }
 
+        if linear is QuantizedLinear {
+            for key in ["scales", "biases"] {
+                if let value = weights["\(prefix).\(key)"] { params[key] = .value(value) }
+            }
+        }
         if !params.isEmpty {
             linear.update(parameters: ModuleParameters(values: params))
         }
