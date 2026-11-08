@@ -12,6 +12,8 @@ final class E2EMixedPrecisionParityTests: XCTestCase {
               let output = env["ASR_PARITY_OUTPUT"] else { throw XCTSkip("Offline parity paths not supplied") }
         let start = Date()
         let model = try await Qwen3ASRModel.fromPretrained(modelId: modelPath)
+        // ASR_PARITY_AUTO_LANGUAGE_PROMPT=1 reproduces mlx-audio's auto-language prompt.
+        model.usesAutoLanguagePrompt = env["ASR_PARITY_AUTO_LANGUAGE_PROMPT"] == "1"
         let loadTime = Date().timeIntervalSince(start)
         let lines = try String(contentsOfFile: input, encoding: .utf8).split(separator: "\n")
         FileManager.default.createFile(atPath: output, contents: nil)

@@ -31,6 +31,13 @@ public class Qwen3ASRModel {
     /// Text decoder config
     public let textConfig: TextDecoderConfig
 
+    /// Opt-in mlx-audio auto-language prompt: with no language set, the model
+    /// writes its own "language X<asr_text>" prefix. Off by default because on
+    /// short code-switched clips the guessed language can be wrong (Thai,
+    /// Arabic or Korean script for English or Mandarin speech). Parity runs
+    /// against mlx-audio turn it on.
+    public var usesAutoLanguagePrompt = false
+
     /// Whether the model weights are loaded and ready for inference.
     var _isLoaded = true
 
@@ -151,10 +158,8 @@ public class Qwen3ASRModel {
             let langTokens = tokenizer.encode(langPrefix)
             inputIds.append(contentsOf: langTokens.map { Int32($0) })
         }
-        // Mixed-precision mlx-audio checkpoints use the native auto-language prompt:
-        // the model generates the language prefix and ASR marker itself.
-        // Keep the historical prompt for legacy decoder-only checkpoints.
-        if language != nil || textConfig.usesLegacyASRPrompt {
+        // The auto-language prompt leaves the language prefix and ASR marker to the model.
+        if language != nil || !usesAutoLanguagePrompt {
             inputIds.append(Int32(asrTextId))
         }
 

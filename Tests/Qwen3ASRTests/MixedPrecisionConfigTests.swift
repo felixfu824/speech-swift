@@ -6,9 +6,8 @@ final class MixedPrecisionConfigTests: XCTestCase {
         let json = #"{"group_size":64,"bits":6,"model.layers.0.self_attn.q_proj":{"group_size":32,"bits":8},"audio_tower.proj1":false}"#
         let recipe = try JSONDecoder().decode(ASRQuantization.self, from: Data(json.utf8))
         var config = TextDecoderConfig.small
-        XCTAssertTrue(config.usesLegacyASRPrompt)
         config.quantization = recipe
-        XCTAssertFalse(config.usesLegacyASRPrompt)
+        XCTAssertNotNil(config.quantization)
         XCTAssertEqual(recipe.settings(for: "model.embed_tokens")?.bits, 6)
         XCTAssertEqual(recipe.settings(for: "model.layers.0.self_attn.q_proj")?.groupSize, 32)
         XCTAssertNil(recipe.settings(for: "audio_tower.proj1"))

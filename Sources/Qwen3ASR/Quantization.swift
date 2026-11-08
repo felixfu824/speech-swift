@@ -67,9 +67,6 @@ public struct ASRQuantization: Codable, Sendable {
 }
 
 extension TextDecoderConfig {
-    // Decoder-only global recipes retain the historical aufklarer prompting.
-    var usesLegacyASRPrompt: Bool { quantization?.overrides.isEmpty != false }
-
     var embeddingSettings: ASRQuantization.Settings {
         guard let quantization else { return .init(groupSize: groupSize, bits: bits) }
         return quantization.settings(for: "model.embed_tokens") ?? .init(groupSize: groupSize, bits: 0)
