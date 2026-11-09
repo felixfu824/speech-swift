@@ -95,7 +95,11 @@ public enum HuggingFaceDownloader {
         //   old: base/cacheKey         (flat, already has weights — won't reach here)
         //   new: base/models/org/model  (Hub-style)
         // For Hub API we need `base` as downloadBase.
-        let hub = makeHubApi(for: modelId, repoDir: directory)
+        // Online only: HubApi otherwise switches itself to offline mode when
+        // the network monitor reports no connection, and that branch accepts
+        // whatever files are on disk. Offline reuse is handled explicitly by the
+        // cache-first step below; a Hub download must really reach the Hub.
+        let hub = makeHubApi(for: modelId, repoDir: directory, useOfflineMode: false)
         let repo = Hub.Repo(id: modelId)
 
         // Cache-first: a complete local snapshot must never require the Hub.
@@ -130,8 +134,13 @@ public enum HuggingFaceDownloader {
         }
 
         try writeIncompleteDownloadMarker(in: directory)
+        beginDownloadAttempt(in: directory)
+        var verified = false
+        defer { endDownloadAttempt(in: directory, verifiedComplete: verified) }
+
+        let destination: URL
         do {
-            try await hub.snapshot(from: repo, matching: globs) { progress in
+            destination = try await hub.snapshot(from: repo, matching: globs) { progress in
                 progressHandler?(progress.fractionCompleted)
             }
         } catch {
@@ -140,7 +149,22 @@ public enum HuggingFaceDownloader {
         // HubApi.snapshot returns normally when its task is cancelled between
         // files; the snapshot is then incomplete, so keep the marker.
         try Task.checkCancellation()
-        removeIncompleteDownloadMarker(in: directory)
+
+        // Clear the marker only when every file the Hub lists for this request
+        // is on disk, so an unexpected early return can never pass as complete.
+        let expected: [String]
+        do {
+            expected = try await hub.getFilenames(from: repo, matching: globs)
+        } catch {
+            throw DownloadError.failedToDownload("\(modelId): \(error.localizedDescription)")
+        }
+        try Task.checkCancellation()
+        let missing = missingFiles(expected, in: destination)
+        guard missing.isEmpty else {
+            throw DownloadError.failedToDownload(
+                "\(modelId): incomplete snapshot, missing \(missing.joined(separator: ", "))")
+        }
+        verified = true
     }
 
     // MARK: - Incomplete Download Marker
@@ -148,6 +172,51 @@ public enum HuggingFaceDownloader {
     /// Relative path of the marker that flags an unfinished Hub download.
     /// It sits under `.cache/`, which Hub's offline file listing skips.
     static let incompleteDownloadMarkerPath = ".cache/speech-swift/download-incomplete"
+
+    /// Hub download attempts per cache directory in this process.
+    struct AttemptState {
+        var running = 0
+        /// Some attempt in the current overlapping group verified a complete snapshot.
+        var verified = false
+    }
+
+    private static let attempts = OSAllocatedUnfairLock<[String: AttemptState]>(initialState: [:])
+
+    static func beginDownloadAttempt(in directory: URL) {
+        let key = directory.standardizedFileURL.path
+        attempts.withLock { $0[key, default: AttemptState()].running += 1 }
+    }
+
+    /// The marker is cleared only when the last overlapping attempt ends and
+    /// one of them verified a complete snapshot. A concurrent attempt that is
+    /// still running therefore keeps the marker, and a cancelled attempt cannot
+    /// remove a file a verified attempt has already completed.
+    static func endDownloadAttempt(in directory: URL, verifiedComplete: Bool) {
+        let key = directory.standardizedFileURL.path
+        let clear = attempts.withLock { table -> Bool in
+            var state = table[key] ?? AttemptState(running: 1)
+            state.running -= 1
+            if verifiedComplete { state.verified = true }
+            if state.running > 0 {
+                table[key] = state
+                return false
+            }
+            table[key] = nil
+            return state.verified
+        }
+        if clear { removeIncompleteDownloadMarker(in: directory) }
+    }
+
+    /// Files from `expected` (Hub-relative paths) that are absent or empty under `directory`.
+    static func missingFiles(_ expected: [String], in directory: URL) -> [String] {
+        expected.filter { name in
+            let path = directory.appendingPathComponent(name).path
+            guard let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int else {
+                return true
+            }
+            return size == 0
+        }
+    }
 
     /// True while a Hub download into `directory` has started but not finished
     /// (it was cancelled, interrupted, or failed). Such a cache may be missing
@@ -165,8 +234,15 @@ public enum HuggingFaceDownloader {
     }
 
     static func removeIncompleteDownloadMarker(in directory: URL) {
-        try? FileManager.default.removeItem(
-            at: directory.appendingPathComponent(incompleteDownloadMarkerPath))
+        let marker = directory.appendingPathComponent(incompleteDownloadMarkerPath)
+        guard FileManager.default.fileExists(atPath: marker.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: marker)
+        } catch {
+            // The cache stays marked (safe: the next load revalidates with the Hub).
+            AudioLog.download.error(
+                "Could not clear incomplete-download marker in \(directory.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     // MARK: - Security Helpers (kept for backward compat + security tests)
@@ -240,6 +316,9 @@ public enum HuggingFaceDownloader {
 
     /// Create a `HubApi` whose `downloadBase` is derived from the repo directory that
     /// `getCacheDirectory` returned (strips the `models/<org>/<model>` suffix).
+    /// Test hook: point Hub requests at another host (e.g. a closed local port).
+    nonisolated(unsafe) static var hubEndpointOverride: String?
+
     private static func makeHubApi(for modelId: String, repoDir: URL, useOfflineMode: Bool? = nil) -> HubApi {
         // repoDir is  base/models/org/model
         // We need     base
@@ -255,6 +334,6 @@ public enum HuggingFaceDownloader {
             // Hub won't match this path, so we derive base from env/defaults.
             downloadBase = resolveBaseCacheDir(cacheDirName: repoDir.deletingLastPathComponent().lastPathComponent)
         }
-        return HubApi(downloadBase: downloadBase, useOfflineMode: useOfflineMode)
+        return HubApi(downloadBase: downloadBase, endpoint: hubEndpointOverride, useOfflineMode: useOfflineMode)
     }
 }
