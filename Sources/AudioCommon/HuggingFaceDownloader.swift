@@ -177,12 +177,22 @@ public enum HuggingFaceDownloader {
         // HubApi.snapshot returns normally when its task is cancelled between
         // files; the snapshot is then incomplete, so keep the marker.
         try Task.checkCancellation()
+        try verifySnapshot(modelId: modelId, expected: expected, in: destination)
+        removeIncompleteDownloadMarker(in: directory)
+    }
+
+    /// Throws unless the Hub listed at least one file for the request and every
+    /// listed file is on disk and non-empty. An empty list proves nothing (the
+    /// repo may have removed or renamed its files), so it never clears a marker.
+    static func verifySnapshot(modelId: String, expected: [String], in destination: URL) throws {
+        guard !expected.isEmpty else {
+            throw DownloadError.failedToDownload("\(modelId): the Hub listed no files for this model")
+        }
         let missing = missingFiles(expected, in: destination)
         guard missing.isEmpty else {
             throw DownloadError.failedToDownload(
                 "\(modelId): incomplete snapshot, missing \(missing.joined(separator: ", "))")
         }
-        removeIncompleteDownloadMarker(in: directory)
     }
 
     // MARK: - Incomplete Download Marker

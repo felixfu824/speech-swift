@@ -121,6 +121,15 @@ final class IncompleteDownloadMarkerTests: XCTestCase {
         XCTAssertFalse(held)
     }
 
+    func testVerificationRejectsAnEmptyHubFileList() throws {
+        // An empty manifest must never count as a complete snapshot.
+        XCTAssertThrowsError(try HuggingFaceDownloader.verifySnapshot(modelId: modelId, expected: [], in: repoDir))
+        XCTAssertThrowsError(try HuggingFaceDownloader.verifySnapshot(
+            modelId: modelId, expected: ["config.json", "vocab.json"], in: repoDir))
+        XCTAssertNoThrow(try HuggingFaceDownloader.verifySnapshot(
+            modelId: modelId, expected: ["config.json", "model.safetensors"], in: repoDir))
+    }
+
     func testMarkerIsHiddenFromOfflineFileListing() throws {
         // The marker must not itself look like a cached model file.
         try HuggingFaceDownloader.writeIncompleteDownloadMarker(in: repoDir)
