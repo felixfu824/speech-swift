@@ -106,16 +106,30 @@ public enum HuggingFaceDownloader {
         // Without this, a Hub outage (e.g. HTTP 503 while the network itself
         // is up, which automatic offline detection does not cover) bricks
         // loading a model that is fully cached on disk.
-        let offlineHub = makeHubApi(for: modelId, repoDir: directory, useOfflineMode: true)
-        do {
-            try await offlineHub.snapshot(from: repo, matching: globs)
-            AudioLog.download.info("Using validated local cache for \(modelId, privacy: .public) (no Hub contact)")
-            return
-        } catch {
+        //
+        // Offline validation only checks the files already on disk, so a
+        // download interrupted between files (cancel, quit, crash, network
+        // loss) would pass it with files missing. The incomplete-download
+        // marker closes that gap: it exists from the start of a Hub download
+        // until the download finishes, so an interrupted download always
+        // resumes from the Hub. Caches without a marker (including ones written
+        // before the marker existed) keep the cache-first behaviour.
+        if hasIncompleteDownloadMarker(in: directory) {
             AudioLog.download.info(
-                "Local cache not usable for \(modelId, privacy: .public) (\(error.localizedDescription, privacy: .public)); contacting Hub")
+                "Previous download of \(modelId, privacy: .public) did not finish; contacting Hub")
+        } else {
+            let offlineHub = makeHubApi(for: modelId, repoDir: directory, useOfflineMode: true)
+            do {
+                try await offlineHub.snapshot(from: repo, matching: globs)
+                AudioLog.download.info("Using validated local cache for \(modelId, privacy: .public) (no Hub contact)")
+                return
+            } catch {
+                AudioLog.download.info(
+                    "Local cache not usable for \(modelId, privacy: .public) (\(error.localizedDescription, privacy: .public)); contacting Hub")
+            }
         }
 
+        try writeIncompleteDownloadMarker(in: directory)
         do {
             try await hub.snapshot(from: repo, matching: globs) { progress in
                 progressHandler?(progress.fractionCompleted)
@@ -123,6 +137,36 @@ public enum HuggingFaceDownloader {
         } catch {
             throw DownloadError.failedToDownload("\(modelId): \(error.localizedDescription)")
         }
+        // HubApi.snapshot returns normally when its task is cancelled between
+        // files; the snapshot is then incomplete, so keep the marker.
+        try Task.checkCancellation()
+        removeIncompleteDownloadMarker(in: directory)
+    }
+
+    // MARK: - Incomplete Download Marker
+
+    /// Relative path of the marker that flags an unfinished Hub download.
+    /// It sits under `.cache/`, which Hub's offline file listing skips.
+    static let incompleteDownloadMarkerPath = ".cache/speech-swift/download-incomplete"
+
+    /// True while a Hub download into `directory` has started but not finished
+    /// (it was cancelled, interrupted, or failed). Such a cache may be missing
+    /// files and is never used without contacting the Hub.
+    public static func hasIncompleteDownloadMarker(in directory: URL) -> Bool {
+        FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent(incompleteDownloadMarkerPath).path)
+    }
+
+    static func writeIncompleteDownloadMarker(in directory: URL) throws {
+        let marker = directory.appendingPathComponent(incompleteDownloadMarkerPath)
+        try FileManager.default.createDirectory(
+            at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: marker)
+    }
+
+    static func removeIncompleteDownloadMarker(in directory: URL) {
+        try? FileManager.default.removeItem(
+            at: directory.appendingPathComponent(incompleteDownloadMarkerPath))
     }
 
     // MARK: - Security Helpers (kept for backward compat + security tests)
