@@ -118,6 +118,32 @@ public enum HuggingFaceDownloader {
         // until the download finishes, so an interrupted download always
         // resumes from the Hub. Caches without a marker (including ones written
         // before the marker existed) keep the cache-first behaviour.
+        //
+        // Downloads into one directory run one at a time in this process, so the
+        // cache check, marker write, download, verification and marker removal
+        // of one attempt never interleave with another attempt's.
+        let key = directory.standardizedFileURL.path
+        await directoryGate.acquire(key)
+        do {
+            try await downloadSerialized(
+                modelId: modelId, repo: repo, globs: globs, directory: directory,
+                hub: hub, progressHandler: progressHandler)
+            await directoryGate.release(key)
+        } catch {
+            await directoryGate.release(key)
+            throw error
+        }
+    }
+
+    private static func downloadSerialized(
+        modelId: String,
+        repo: Hub.Repo,
+        globs: [String],
+        directory: URL,
+        hub: HubApi,
+        progressHandler: ((Double) -> Void)?
+    ) async throws {
+        try Task.checkCancellation()
         if hasIncompleteDownloadMarker(in: directory) {
             AudioLog.download.info(
                 "Previous download of \(modelId, privacy: .public) did not finish; contacting Hub")
@@ -134,12 +160,14 @@ public enum HuggingFaceDownloader {
         }
 
         try writeIncompleteDownloadMarker(in: directory)
-        beginDownloadAttempt(in: directory)
-        var verified = false
-        defer { endDownloadAttempt(in: directory, verifiedComplete: verified) }
-
         let destination: URL
+        let expected: [String]
         do {
+            // The file list is taken before the download, so verifying it adds
+            // no request that could fail after the files are on disk. If the
+            // repo changes in between, verification can only fail (keeping the
+            // marker for a retry); it can never accept a partial snapshot.
+            expected = try await hub.getFilenames(from: repo, matching: globs)
             destination = try await hub.snapshot(from: repo, matching: globs) { progress in
                 progressHandler?(progress.fractionCompleted)
             }
@@ -149,22 +177,12 @@ public enum HuggingFaceDownloader {
         // HubApi.snapshot returns normally when its task is cancelled between
         // files; the snapshot is then incomplete, so keep the marker.
         try Task.checkCancellation()
-
-        // Clear the marker only when every file the Hub lists for this request
-        // is on disk, so an unexpected early return can never pass as complete.
-        let expected: [String]
-        do {
-            expected = try await hub.getFilenames(from: repo, matching: globs)
-        } catch {
-            throw DownloadError.failedToDownload("\(modelId): \(error.localizedDescription)")
-        }
-        try Task.checkCancellation()
         let missing = missingFiles(expected, in: destination)
         guard missing.isEmpty else {
             throw DownloadError.failedToDownload(
                 "\(modelId): incomplete snapshot, missing \(missing.joined(separator: ", "))")
         }
-        verified = true
+        removeIncompleteDownloadMarker(in: directory)
     }
 
     // MARK: - Incomplete Download Marker
@@ -173,39 +191,8 @@ public enum HuggingFaceDownloader {
     /// It sits under `.cache/`, which Hub's offline file listing skips.
     static let incompleteDownloadMarkerPath = ".cache/speech-swift/download-incomplete"
 
-    /// Hub download attempts per cache directory in this process.
-    struct AttemptState {
-        var running = 0
-        /// Some attempt in the current overlapping group verified a complete snapshot.
-        var verified = false
-    }
-
-    private static let attempts = OSAllocatedUnfairLock<[String: AttemptState]>(initialState: [:])
-
-    static func beginDownloadAttempt(in directory: URL) {
-        let key = directory.standardizedFileURL.path
-        attempts.withLock { $0[key, default: AttemptState()].running += 1 }
-    }
-
-    /// The marker is cleared only when the last overlapping attempt ends and
-    /// one of them verified a complete snapshot. A concurrent attempt that is
-    /// still running therefore keeps the marker, and a cancelled attempt cannot
-    /// remove a file a verified attempt has already completed.
-    static func endDownloadAttempt(in directory: URL, verifiedComplete: Bool) {
-        let key = directory.standardizedFileURL.path
-        let clear = attempts.withLock { table -> Bool in
-            var state = table[key] ?? AttemptState(running: 1)
-            state.running -= 1
-            if verifiedComplete { state.verified = true }
-            if state.running > 0 {
-                table[key] = state
-                return false
-            }
-            table[key] = nil
-            return state.verified
-        }
-        if clear { removeIncompleteDownloadMarker(in: directory) }
-    }
+    /// Serializes downloads per cache directory within this process.
+    static let directoryGate = DirectoryGate()
 
     /// Files from `expected` (Hub-relative paths) that are absent or empty under `directory`.
     static func missingFiles(_ expected: [String], in directory: URL) -> [String] {
@@ -336,4 +323,31 @@ public enum HuggingFaceDownloader {
         }
         return HubApi(downloadBase: downloadBase, endpoint: hubEndpointOverride, useOfflineMode: useOfflineMode)
     }
+}
+
+/// An async mutex per key: one holder at a time, waiters served in order.
+/// Ownership passes directly from a releasing holder to the next waiter.
+actor DirectoryGate {
+    private var held: Set<String> = []
+    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func acquire(_ key: String) async {
+        guard held.contains(key) else {
+            held.insert(key)
+            return
+        }
+        await withCheckedContinuation { waiters[key, default: []].append($0) }
+    }
+
+    func release(_ key: String) {
+        if var queue = waiters[key], !queue.isEmpty {
+            let next = queue.removeFirst()
+            waiters[key] = queue.isEmpty ? nil : queue
+            next.resume()
+        } else {
+            held.remove(key)
+        }
+    }
+
+    func isHeld(_ key: String) -> Bool { held.contains(key) }
 }

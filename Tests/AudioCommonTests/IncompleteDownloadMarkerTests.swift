@@ -81,21 +81,44 @@ final class IncompleteDownloadMarkerTests: XCTestCase {
         XCTAssertEqual(missing, ["vocab.json", "empty.json"])
     }
 
-    func testMarkerClearsOnlyAfterTheLastOverlappingAttempt() throws {
+    func testConcurrentResumesOfAMarkedCacheAllFailAndKeepTheMarker() async throws {
         try HuggingFaceDownloader.writeIncompleteDownloadMarker(in: repoDir)
-        // Two overlapping attempts; the verified one ends first: the other is still running.
-        HuggingFaceDownloader.beginDownloadAttempt(in: repoDir)
-        HuggingFaceDownloader.beginDownloadAttempt(in: repoDir)
-        HuggingFaceDownloader.endDownloadAttempt(in: repoDir, verifiedComplete: true)
-        XCTAssertTrue(marked, "a concurrent attempt is still running")
-        HuggingFaceDownloader.endDownloadAttempt(in: repoDir, verifiedComplete: false)
-        XCTAssertFalse(marked, "the group had a verified complete snapshot")
-
-        // A lone attempt that did not verify keeps the marker.
-        try HuggingFaceDownloader.writeIncompleteDownloadMarker(in: repoDir)
-        HuggingFaceDownloader.beginDownloadAttempt(in: repoDir)
-        HuggingFaceDownloader.endDownloadAttempt(in: repoDir, verifiedComplete: false)
+        let dir = repoDir!, id = modelId
+        let failures = await withTaskGroup(of: Bool.self) { group -> Int in
+            for _ in 0..<4 {
+                group.addTask {
+                    do {
+                        try await HuggingFaceDownloader.downloadWeights(
+                            modelId: id, to: dir, additionalFiles: ["vocab.json"])
+                        return false
+                    } catch { return true }
+                }
+            }
+            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
+        }
+        XCTAssertEqual(failures, 4)
         XCTAssertTrue(marked)
+        let held = await HuggingFaceDownloader.directoryGate.isHeld(repoDir.standardizedFileURL.path)
+        XCTAssertFalse(held, "every attempt released the directory gate")
+    }
+
+    func testDirectoryGateAdmitsOneHolderAtATime() async throws {
+        let gate = DirectoryGate()
+        await gate.acquire("k")
+        let order = OrderLog()
+        let waiter = Task {
+            await gate.acquire("k")
+            await order.append("waiter")
+            await gate.release("k")
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await order.append("holder")
+        await gate.release("k")
+        await waiter.value
+        let events = await order.events
+        XCTAssertEqual(events, ["holder", "waiter"])
+        let held = await gate.isHeld("k")
+        XCTAssertFalse(held)
     }
 
     func testMarkerIsHiddenFromOfflineFileListing() throws {
@@ -105,4 +128,9 @@ final class IncompleteDownloadMarkerTests: XCTestCase {
             at: repoDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         XCTAssertEqual(Set(visible.map(\.lastPathComponent)), ["config.json", "model.safetensors"])
     }
+}
+
+private actor OrderLog {
+    var events: [String] = []
+    func append(_ e: String) { events.append(e) }
 }
